@@ -1,0 +1,32 @@
+{
+  "version": "2.0.0",
+  "tasks": [
+    {
+      "type": "PlatformIO",
+      "task": "Build",
+      "problemMatcher": [
+        "$platformio"
+      ],
+      "group": "build",
+      "label": "PlatformIO: Build"
+    },
+    {
+      "label": "WeatherStation: OTA Upload",
+      "type": "shell",
+      "command": "C:\\Users\\Dave\\.platformio\\penv\\Scripts\\platformio.exe",
+      "args": [
+        "run",
+        "-e",
+        "nodemcuv2_ota",
+        "-t",
+        "upload",
+        "--upload-port",
+        "192.168.0.102"
+      ],
+      "problemMatcher": [
+        "$platformio"
+      ],
+      "group": "build"
+    }
+  ]
+}

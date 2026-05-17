@@ -4,14 +4,17 @@
 #include <ESP8266HTTPClient.h>
 #include <WiFiClientSecure.h>
 #include <ThingSpeak.h>
-#include <DHT.h>
+#include <Adafruit_SHT31.h>
+#include <PubSubClient.h>
 #include <Adafruit_BMP085.h>
 #include <BH1750.h>
 #include <ArduinoJson.h>
+#include <ArduinoOTA.h>
 #include <time.h>
 #include <math.h>
 #include "SSD1306Wire.h"
 #include "secrets.h"
+
 
 // =========================
 // USER SETTINGS
@@ -19,17 +22,17 @@
 const char* NTP_SERVER = "0.au.pool.ntp.org";
 const char* TZ_INFO    = "AEST-10AEDT,M10.1.0,M4.1.0/3";
 
-#define DHTPIN D5
-#define DHTTYPE DHT11      // Change to DHT22 if needed
+#define SHT31_ADDRESS_PRIMARY 0x44
+#define SHT31_ADDRESS_SECONDARY 0x45
 
-#define I2C_SDA D3
-#define I2C_SCL D4
+#define I2C_SDA D2
+#define I2C_SCL D1
 #define OLED_ADDRESS 0x3C
 
 const unsigned long SENSOR_READ_INTERVAL_MS    = 30000UL;    // 30 sec
 const unsigned long SENSOR_UPLOAD_INTERVAL_MS  = 600000UL;   // 10 min
 const unsigned long FORECAST_REFRESH_MS        = 1800000UL;  // 30 min
-const unsigned long PAGE_ROTATE_MS             = 5000UL;     // 5 sec
+const unsigned long PAGE_ROTATE_MS             = 6000UL;     // 5 sec
 
 const int PRESSURE_HISTORY_SIZE = 18; // 18 x 10 minutes = 3 hours
 const float PRESSURE_TREND_THRESHOLD_HPA = 0.15f;
@@ -38,7 +41,18 @@ const float PRESSURE_TREND_THRESHOLD_HPA = 0.15f;
 // GLOBALS
 // =========================
 WiFiClient tsClient;
-DHT dht(DHTPIN, DHTTYPE);
+
+WiFiClient mqttNetClient;
+PubSubClient mqttClient(mqttNetClient);
+
+unsigned long lastMqttConnectAttempt = 0;
+const unsigned long MQTT_RECONNECT_INTERVAL_MS = 10000UL;
+
+Adafruit_SHT31 sht31 = Adafruit_SHT31();
+bool sht31Found = false;
+uint8_t sht31Address = SHT31_ADDRESS_PRIMARY;
+uint8_t sht31FailCount = 0;
+const uint8_t SHT31_REINIT_AFTER_FAILS = 3;
 Adafruit_BMP085 bmp;
 BH1750 lightMeter;
 SSD1306Wire display(OLED_ADDRESS, I2C_SDA, I2C_SCL);
@@ -205,11 +219,11 @@ String shortDayNameFromISO(const String& isoDate) {
 // ICONS / HELPERS
 // =========================
 String degC(int value) {
-  return String(value) + "\xB0" + "C";
+  return String(value) + "\xB0" + "°C";
 }
 
 String degC1(float value) {
-  return String(value, 1) + "\xB0" + "C";
+  return String(value, 1) + "\xB0" + "°C";
 }
 
 void drawBoldString(int x, int y, const String& s) {
@@ -458,7 +472,18 @@ String pressureTrendSymbol() {
 void initSensors() {
   Wire.begin(I2C_SDA, I2C_SCL);
 
-  dht.begin();
+  if (sht31.begin(SHT31_ADDRESS_PRIMARY)) {
+    sht31Found = true;
+    sht31Address = SHT31_ADDRESS_PRIMARY;
+    Serial.println("SHT31D found at 0x44");
+  } else if (sht31.begin(SHT31_ADDRESS_SECONDARY)) {
+    sht31Found = true;
+    sht31Address = SHT31_ADDRESS_SECONDARY;
+    Serial.println("SHT31D found at 0x45");
+  } else {
+    sht31Found = false;
+    Serial.println("SHT31D not found");
+  }
 
   if (bmp.begin()) {
     bmpFound = true;
@@ -476,8 +501,29 @@ void initSensors() {
 }
 
 void readLocalSensors() {
-  currentTempC = dht.readTemperature();
-  currentHumidity = dht.readHumidity();
+  if (sht31Found) {
+    float t = sht31.readTemperature();
+    float h = sht31.readHumidity();
+
+    if (!isnan(t) && !isnan(h)) {
+      currentTempC = t;
+      currentHumidity = h;
+      sht31FailCount = 0;
+    } else {
+      sht31FailCount++;
+      Serial.print("SHT31D read failed, count: ");
+      Serial.println(sht31FailCount);
+
+      if (sht31FailCount >= SHT31_REINIT_AFTER_FAILS) {
+        Serial.println("Reinitialising SHT31D");
+        sht31.begin(sht31Address);
+        sht31FailCount = 0;
+      }
+    }
+  } else {
+    currentTempC = NAN;
+    currentHumidity = NAN;
+  }
 
   if (bmpFound) {
     currentPressureHpa = bmp.readPressure() / 100.0f;
@@ -629,23 +675,42 @@ void drawSensorsPage() {
   display.setFont(ArialMT_Plain_16);
 
   {
-    String s = isnan(currentTempC) ? "--" : degC1(currentTempC);
+    // Temperature in the first quadrant 0-63, 0-31
+    String s = "Temperature";
+    display.setFont(ArialMT_Plain_10);
     drawCenteredBoldString(32, 8, s);
+    s = isnan(currentTempC) ? "--" : degC1(currentTempC);
+    display.setFont(ArialMT_Plain_16);
+    drawCenteredBoldString(32, 24, s);
   }
 
   {
-    String s = isnan(currentHumidity) ? "--" : String(currentHumidity, 1) + "%";
+    // Humidity in the second quadrant
+    String s = "Humidity";
+    display.setFont(ArialMT_Plain_10);
     drawCenteredBoldString(96, 8, s);
+    s = isnan(currentHumidity) ? "--" : String(currentHumidity, 1) + "%";
+    display.setFont(ArialMT_Plain_16);
+    drawCenteredBoldString(96, 24, s);
   }
 
   {
-    String s = isnan(currentPressureHpa) ? "--" : String(currentPressureHpa, 0) + pressureTrendSymbol();
-    drawCenteredBoldString(32, 48, s);
+    // Barometric Pressure
+    String s = "Pressure";
+    display.setFont(ArialMT_Plain_10);
+    drawCenteredBoldString(32, 40, s);
+    s = isnan(currentPressureHpa) ? "--" : String(currentPressureHpa, 0) + "hPa " + pressureTrendSymbol();
+    display.setFont(ArialMT_Plain_16);
+    drawCenteredBoldString(32, 56, s);
   }
 
   {
-    String s = isnan(currentLux) ? "--" : String(currentLux, 0) + "lx";
-    drawCenteredBoldString(96, 48, s);
+    // Light sensor
+    String s = "Light";
+    display.setFont(ArialMT_Plain_10);
+    drawCenteredBoldString(96, 40, s);
+    s = isnan(currentLux) ? "--" : String(currentLux, 0) + "lx";
+    drawCenteredBoldString(96, 56, s);
   }
 
   display.display();
@@ -678,7 +743,7 @@ void drawTodayForecastPage() {
   display.drawString(76, 30, isnan(currentHumidity) ? "--" : String(currentHumidity, 0) + "%");
 
   // Yellow zone
-  display.drawString(36, 48, "L " + degC((int)round(forecast[0].tMin)));
+  display.drawString(4, 48, "L " + degC((int)round(forecast[0].tMin)));
   display.drawString(94, 48, "H " + degC((int)round(forecast[0].tMax)));
 
   display.display();
@@ -737,6 +802,278 @@ void updateDisplay() {
 }
 
 // =========================
+// MQTT
+// =========================
+String mqttTopic(const char* suffix) {
+  return String(MQTT_BASE_TOPIC) + "/" + suffix;
+}
+
+bool mqttConfigured() {
+  return strlen(MQTT_HOST) > 0;
+}
+
+void mqttPublish(const char* suffix, const String& payload, bool retained = false) {
+  if (!mqttConfigured() || !mqttClient.connected()) return;
+  String topic = mqttTopic(suffix);
+  mqttClient.publish(topic.c_str(), payload.c_str(), retained);
+}
+
+void mqttPublishFloat(const char* suffix, float value, uint8_t decimals, bool retained = false) {
+  if (isnan(value)) return;
+  mqttPublish(suffix, String(value, decimals), retained);
+}
+
+void publishMqttReadings() {
+  mqttPublishFloat("sensor/temperature", currentTempC, 2, true);
+  mqttPublishFloat("sensor/humidity", currentHumidity, 2, true);
+  mqttPublishFloat("sensor/pressure", currentPressureHpa, 2, true);
+  mqttPublishFloat("sensor/lux", currentLux, 1, true);
+
+  mqttPublish("status/rssi", String(WiFi.RSSI()), true);
+  mqttPublish("status/ip", WiFi.localIP().toString(), true);
+  mqttPublish("status/page", String(pageIndex), true);
+  mqttPublish("status/uptime_ms", String(millis()), false);
+}
+
+void mqttPublishRaw(const String& topic, const String& payload, bool retained = false) {
+  if (!mqttConfigured() || !mqttClient.connected()) return;
+  mqttClient.publish(topic.c_str(), payload.c_str(), retained);
+}
+
+String discoveryDeviceJson() {
+  return "\"dev\":{\"ids\":[\"weatherstation_esp8266\"],\"name\":\"Weather Station\",\"mf\":\"Dave\",\"mdl\":\"ESP8266 NodeMCU\"}";
+}
+
+void publishDiscoverySensor(
+  const char* objectId,
+  const char* name,
+  const char* stateTopic,
+  const char* unit,
+  const char* deviceClass,
+  const char* stateClass
+) {
+  String topic = String("homeassistant/sensor/weatherstation_") + objectId + "/config";
+
+  String payload = "{";
+  payload += "\"name\":\"";
+  payload += name;
+  payload += "\",\"uniq_id\":\"weatherstation_";
+  payload += objectId;
+  payload += "\",\"stat_t\":\"";
+  payload += stateTopic;
+  payload += "\"";
+
+  if (strlen(unit) > 0) {
+    payload += ",\"unit_of_meas\":\"";
+    payload += unit;
+    payload += "\"";
+  }
+
+  if (strlen(deviceClass) > 0) {
+    payload += ",\"dev_cla\":\"";
+    payload += deviceClass;
+    payload += "\"";
+  }
+
+  if (strlen(stateClass) > 0) {
+    payload += ",\"stat_cla\":\"";
+    payload += stateClass;
+    payload += "\"";
+  }
+
+  payload += ",\"avty_t\":\"weatherstation/status/state\"";
+  payload += ",\"pl_avail\":\"online\"";
+  payload += ",\"pl_not_avail\":\"offline\"";
+  payload += ",";
+  payload += discoveryDeviceJson();
+  payload += "}";
+
+  mqttPublishRaw(topic, payload, true);
+}
+
+void publishHomeAssistantDiscovery() {
+  publishDiscoverySensor(
+    "temperature",
+    "Temperature",
+    "weatherstation/sensor/temperature",
+    "°C",
+    "temperature",
+    "measurement"
+  );
+
+  publishDiscoverySensor(
+    "humidity",
+    "Humidity",
+    "weatherstation/sensor/humidity",
+    "%",
+    "humidity",
+    "measurement"
+  );
+
+  publishDiscoverySensor(
+    "pressure",
+    "Pressure",
+    "weatherstation/sensor/pressure",
+    "hPa",
+    "atmospheric_pressure",
+    "measurement"
+  );
+
+  publishDiscoverySensor(
+    "lux",
+    "Light",
+    "weatherstation/sensor/lux",
+    "lx",
+    "illuminance",
+    "measurement"
+  );
+
+  publishDiscoverySensor(
+    "rssi",
+    "WiFi RSSI",
+    "weatherstation/status/rssi",
+    "dBm",
+    "signal_strength",
+    "measurement"
+  );
+}
+
+void mqttCallback(char* topic, byte* payload, unsigned int length) {
+  String t = String(topic);
+  String msg;
+
+  for (unsigned int i = 0; i < length; i++) {
+    msg += (char)payload[i];
+  }
+
+  msg.trim();
+
+  if (t == mqttTopic("cmd/reboot")) {
+    if (msg == "1" || msg == "ON" || msg == "reboot") {
+      mqttPublish("status/state", "rebooting", true);
+      delay(250);
+      ESP.restart();
+    }
+  }
+
+  if (t == mqttTopic("cmd/force_read")) {
+    if (msg == "1" || msg == "ON" || msg == "read") {
+      readLocalSensors();
+      publishMqttReadings();
+      updateDisplay();
+    }
+  }
+
+  if (t == mqttTopic("cmd/force_upload")) {
+    if (msg == "1" || msg == "ON" || msg == "upload") {
+      uploadThingSpeak();
+    }
+  }
+
+  if (t == mqttTopic("cmd/page")) {
+    int requestedPage = msg.toInt();
+    if (requestedPage >= 0 && requestedPage <= 3) {
+      pageIndex = requestedPage;
+      mqttPublish("status/page", String(pageIndex), true);
+      updateDisplay();
+    }
+  }
+}
+
+void connectMQTT() {
+  if (!mqttConfigured()) return;
+  if (mqttClient.connected()) return;
+  if (WiFi.status() != WL_CONNECTED) return;
+
+  unsigned long now = millis();
+  if (now - lastMqttConnectAttempt < MQTT_RECONNECT_INTERVAL_MS) return;
+  lastMqttConnectAttempt = now;
+
+  mqttClient.setServer(MQTT_HOST, MQTT_PORT);
+  mqttClient.setCallback(mqttCallback);
+  mqttClient.setBufferSize(768);
+
+  Serial.print("Connecting to MQTT ");
+  Serial.print(MQTT_HOST);
+  Serial.print(":");
+  Serial.println(MQTT_PORT);
+
+  bool connected = false;
+
+  if (strlen(MQTT_USER) > 0) {
+    connected = mqttClient.connect(
+      MQTT_CLIENT_ID,
+      MQTT_USER,
+      MQTT_PASSWORD,
+      mqttTopic("status/state").c_str(),
+      0,
+      true,
+      "offline"
+    );
+  } else {
+    connected = mqttClient.connect(
+      MQTT_CLIENT_ID,
+      mqttTopic("status/state").c_str(),
+      0,
+      true,
+      "offline"
+    );
+  }
+
+  if (connected) {
+    Serial.println("MQTT connected");
+
+    mqttPublish("status/state", "online", true);
+    mqttPublish("status/ip", WiFi.localIP().toString(), true);
+    mqttPublish("status/rssi", String(WiFi.RSSI()), true);
+    mqttPublish("status/ota", "ready", true);
+
+    mqttClient.subscribe(mqttTopic("cmd/reboot").c_str());
+    mqttClient.subscribe(mqttTopic("cmd/force_read").c_str());
+    mqttClient.subscribe(mqttTopic("cmd/force_upload").c_str());
+    mqttClient.subscribe(mqttTopic("cmd/page").c_str());
+
+    publishHomeAssistantDiscovery();
+    publishMqttReadings();
+  } else {
+    Serial.print("MQTT connect failed, rc=");
+    Serial.println(mqttClient.state());
+  }
+}
+
+// =========================
+// OTA
+// =========================
+void initOTA() {
+  ArduinoOTA.setHostname(OTA_HOSTNAME);
+  ArduinoOTA.setPassword(OTA_PASSWORD);
+
+  ArduinoOTA.onStart([]() {
+    Serial.println("OTA start");
+    mqttPublish("status/ota", "starting", true);
+  });
+
+  ArduinoOTA.onEnd([]() {
+    Serial.println("OTA end");
+    mqttPublish("status/ota", "complete", true);
+  });
+
+  ArduinoOTA.onProgress([](unsigned int progress, unsigned int total) {
+    unsigned int pct = (progress * 100U) / total;
+    Serial.printf("OTA progress: %u%%\n", pct);
+  });
+
+  ArduinoOTA.onError([](ota_error_t error) {
+    Serial.printf("OTA error: %u\n", error);
+    mqttPublish("status/ota", String("error ") + String(error), true);
+  });
+
+  ArduinoOTA.begin();
+  Serial.println("OTA ready");
+  mqttPublish("status/ota", "ready", true);
+}
+
+// =========================
 // SETUP / LOOP
 // =========================
 void setup() {
@@ -750,6 +1087,8 @@ void setup() {
   connectWiFi();
   initTime();
   ThingSpeak.begin(tsClient);
+  connectMQTT();
+  initOTA();
 
   readLocalSensors();
   fetchForecast();
@@ -782,6 +1121,10 @@ void loop() {
     initTime();
   }
 
+  connectMQTT();
+  mqttClient.loop();
+  ArduinoOTA.handle();
+
   unsigned long now = millis();
 
   if (now - lastPageChange >= PAGE_ROTATE_MS) {
@@ -793,6 +1136,7 @@ void loop() {
   if (now - lastSensorRead >= SENSOR_READ_INTERVAL_MS) {
     lastSensorRead = now;
     readLocalSensors();
+    publishMqttReadings();
     updateDisplay();
   }
 
